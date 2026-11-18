@@ -524,8 +524,8 @@ def available_sources(
     # consent pattern as Perplexity). Unlike tiktok/instagram, which are
     # offered during SKILL.md Step 0 onboarding, LinkedIn is power-user-only
     # and must not silently activate for existing SCRAPECREATORS_API_KEY
-    # holders.
-    if config.get("SCRAPECREATORS_API_KEY") and (
+    # holders. A configured Unipile account serves it too (linkedin.py).
+    if (config.get("SCRAPECREATORS_API_KEY") or linkedin.unipile_settings(config)) and (
         "linkedin" in include_sources or (requested_sources and "linkedin" in requested_sources)
     ):
         available.append("linkedin")
@@ -7401,6 +7401,22 @@ def _retrieve_stream_impl(
             cacheable=_clean_stream_result,
         )
     if source == "linkedin":
+        unipile = linkedin.unipile_settings(config)
+        if unipile:
+            # Unipile searches LinkedIn as the user's own connected account;
+            # article enrichment is a ScrapeCreators profile call, so it is
+            # not attempted on this backend.
+            result = linkedin.search_linkedin_unipile(
+                subquery.search_query,
+                from_date,
+                to_date,
+                depth=depth,
+                settings=unipile,
+            )
+            items = linkedin.parse_linkedin_response(
+                result, from_date=from_date, to_date=to_date
+            )
+            return items, _result_outcome_artifact(source, result)
         token = config.get("SCRAPECREATORS_API_KEY", "")
         result = linkedin.search_linkedin(
             subquery.search_query,

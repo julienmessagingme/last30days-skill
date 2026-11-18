@@ -54,7 +54,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from . import backends, brightdata, digg, env, health, http, prescriptions, reddit_health, trustpilot, x_api
+from . import backends, brightdata, digg, env, health, http, linkedin, prescriptions, reddit_health, trustpilot, x_api
 from .backends import TIER_ERROR, TIER_OK, TIER_WARN
 
 # Rollup tiers (R1). ok/warn/error are U2's; only "off" is doctor's own.
@@ -211,6 +211,7 @@ _OPTIONAL_CLI_SOURCES = frozenset({"github"})
 # Key-presence booleans for the setup block. NEVER values.
 KEY_PRESENCE_VARS = (
     "SCRAPECREATORS_API_KEY",
+    "UNIPILE_API_KEY",
     "XAI_API_KEY",
     "XQUIK_API_KEY",
     "X_BEARER_TOKEN",
@@ -967,8 +968,11 @@ def _meta_ads_record(config):
 
 
 def _linkedin_record(config):
-    requires = "SCRAPECREATORS_API_KEY + INCLUDE_SOURCES=linkedin"
-    if not config.get("SCRAPECREATORS_API_KEY"):
+    requires = (
+        "SCRAPECREATORS_API_KEY (or UNIPILE_DSN + UNIPILE_API_KEY + UNIPILE_ACCOUNT_ID)"
+        " + INCLUDE_SOURCES=linkedin"
+    )
+    if not (config.get("SCRAPECREATORS_API_KEY") or linkedin.unipile_settings(config)):
         return _record(status="unconfigured", requires=requires, fix=_sc_fix())
     if "linkedin" in env.include_sources(config):
         return _record(status=health.OK, requires=requires)

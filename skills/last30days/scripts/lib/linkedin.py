@@ -608,3 +608,166 @@ def enrich_articles(
     if articles:
         _log(f"Found {len(articles)} article(s)")
     return articles
+
+
+# --- Unipile backend ----------------------------------------------------------
+#
+# Unipile (https://developer.unipile.com) runs LinkedIn's own post search
+# through a LinkedIn account the user connected to Unipile: results are what
+# that account can see, with live reaction, comment and repost counts. It is
+# selected when UNIPILE_DSN, UNIPILE_API_KEY and UNIPILE_ACCOUNT_ID are all set,
+# and then takes precedence over ScrapeCreators for this source.
+
+# Accepted `date_posted` values of a classic posts search, narrowest first. A
+# window wider than a month is widened to past_month; parse_linkedin_response
+# then enforces the caller's real from_date/to_date.
+UNIPILE_DATE_POSTED_BUCKETS: tuple[tuple[int, str], ...] = (
+    (1, "past_day"),
+    (7, "past_week"),
+    (31, "past_month"),
+)
+# Documented ceiling of one classic posts search page.
+UNIPILE_MAX_LIMIT = 49
+# LinkedIn's post search is slow behind Unipile (30 to 55 s observed).
+UNIPILE_TIMEOUT = 60.0
+# Bounds the cursor loop; max_results is reached well before in practice.
+UNIPILE_MAX_PAGES = 3
+
+
+def unipile_settings(config: Dict[str, Any] | None) -> Dict[str, str] | None:
+    """Unipile connection settings, or None unless all three are configured."""
+    config = config or {}
+    dsn = str(config.get("UNIPILE_DSN") or "").strip()
+    api_key = str(config.get("UNIPILE_API_KEY") or "").strip()
+    account_id = str(config.get("UNIPILE_ACCOUNT_ID") or "").strip()
+    if not (dsn and api_key and account_id):
+        return None
+    dsn = re.sub(r"^https?://", "", dsn).rstrip("/")
+    return {"dsn": dsn, "api_key": api_key, "account_id": account_id}
+
+
+def _unipile_date_posted(from_date: str, to_date: str) -> str:
+    """Smallest Unipile date_posted bucket that covers the window."""
+    start = _coerce_date(from_date)
+    end = _coerce_date(to_date)
+    widest = UNIPILE_DATE_POSTED_BUCKETS[-1][1]
+    if not start or not end:
+        return widest
+    days = max(1, (end - start).days + 1)
+    for max_days, bucket in UNIPILE_DATE_POSTED_BUCKETS:
+        if days <= max_days:
+            return bucket
+    return widest
+
+
+def _unipile_post(raw: Any) -> Dict[str, Any] | None:
+    """Map a Unipile post item onto the keys parse_linkedin_response reads."""
+    if not isinstance(raw, dict):
+        return None
+    author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
+    profile_url = str(author.get("profile_url") or "").strip()
+    handle = str(author.get("public_identifier") or "").strip()
+    if not profile_url and handle:
+        kind = "company" if author.get("is_company") else "in"
+        profile_url = f"https://www.linkedin.com/{kind}/{handle}"
+    return {
+        "description": str(raw.get("text") or "").strip(),
+        "url": str(raw.get("share_url") or "").split("?")[0].strip(),
+        "urn": str(raw.get("social_id") or raw.get("id") or ""),
+        "author": {"name": str(author.get("name") or "").strip(), "url": profile_url},
+        "datePublished": raw.get("parsed_datetime") or "",
+        "likes": raw.get("reaction_counter"),
+        "comments": raw.get("comment_counter"),
+        "reposts": raw.get("repost_counter"),
+    }
+
+
+def search_linkedin_unipile(
+    topic: str,
+    from_date: str,
+    to_date: str,
+    depth: str = "default",
+    settings: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    """Search LinkedIn posts via Unipile's classic posts search.
+
+    Returns the same shape as search_linkedin: a 'posts' list, plus 'error'
+    (and 'partial' when some posts came back) on failure.
+    """
+    if not settings:
+        _log("No Unipile settings, skipping")
+        return {"posts": []}
+    query = topic.strip()
+    if not query:
+        _log("Empty query, skipping")
+        return {"posts": []}
+
+    cfg = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
+    max_results = int(cfg["max_results"])
+    date_posted = _unipile_date_posted(from_date, to_date)
+    url = f"https://{settings['dsn']}/api/v1/linkedin/search"
+    headers = {"X-API-KEY": settings["api_key"], "Accept": "application/json"}
+    body = {
+        "api": "classic",
+        "category": "posts",
+        "keywords": query,
+        "sort_by": "relevance",
+        "date_posted": date_posted,
+    }
+    _log(f"Searching for '{query}' via Unipile (date_posted={date_posted}, max_results={max_results})")
+
+    posts: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    cursor: str | None = None
+    error: str | None = None
+    for _ in range(UNIPILE_MAX_PAGES):
+        params: Dict[str, Any] = {
+            "account_id": settings["account_id"],
+            "limit": min(UNIPILE_MAX_LIMIT, max_results - len(posts)),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            response = http.post(
+                url, body, headers=headers, params=params,
+                timeout=UNIPILE_TIMEOUT, retries=1,
+            )
+        except http.HTTPError as exc:
+            error = f"Unipile HTTP {exc.status_code}"
+            _log(f"Search failed ({error})")
+            break
+        except Exception as exc:
+            error = f"Unipile {type(exc).__name__}"
+            _log(f"Search failed ({error}: {exc})")
+            break
+
+        items = response.get("items") if isinstance(response, dict) else None
+        if not isinstance(items, list) or not items:
+            break
+        for raw in items:
+            post = _unipile_post(raw)
+            if not post or not post["description"]:
+                continue
+            key = _dedupe_key(post)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            posts.append(post)
+            if len(posts) >= max_results:
+                break
+        if len(posts) >= max_results:
+            break
+        next_cursor = response.get("cursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    if not posts and error:
+        return {"posts": [], "error": error}
+    result: Dict[str, Any] = {"posts": posts}
+    if error:
+        result["partial"] = True
+        result["error"] = error
+    _log(f"Found {len(posts)} posts via Unipile")
+    return result

@@ -421,5 +421,134 @@ class TestEnrichArticles(unittest.TestCase):
             mock_request.assert_not_called()
 
 
+class TestUnipileBackend(unittest.TestCase):
+    SETTINGS = {"dsn": "api1.unipile.com:13111", "api_key": "fake-key", "account_id": "acc_123"}
+
+    def _unipile_item(self, **overrides):
+        # Mirrors a Unipile classic posts search item (developer.unipile.com).
+        base = {
+            "type": "post",
+            "social_id": "urn:li:activity:7300000000000000001",
+            "share_url": "https://www.linkedin.com/posts/janedoe_activity-7300000000000000001-abcd?utm_source=share",
+            "date": "2d",
+            "parsed_datetime": "2026-11-12T08:15:00.000Z",
+            "comment_counter": 7,
+            "reaction_counter": 120,
+            "repost_counter": 3,
+            "text": "Conversational commerce is moving to messaging apps.",
+            "author": {
+                "public_identifier": "janedoe",
+                "name": "Jane Doe",
+                "is_company": False,
+                "headline": "CMO",
+            },
+        }
+        base.update(overrides)
+        return base
+
+    def test_settings_require_all_three(self):
+        from lib.linkedin import unipile_settings
+
+        self.assertIsNone(unipile_settings({}))
+        self.assertIsNone(unipile_settings({"UNIPILE_DSN": "x", "UNIPILE_API_KEY": "y"}))
+        settings = unipile_settings({
+            "UNIPILE_DSN": "https://api1.unipile.com:13111/",
+            "UNIPILE_API_KEY": "k",
+            "UNIPILE_ACCOUNT_ID": "a",
+        })
+        self.assertEqual("api1.unipile.com:13111", settings["dsn"])
+
+    def test_date_posted_bucket_covers_window(self):
+        from lib.linkedin import _unipile_date_posted
+
+        self.assertEqual("past_day", _unipile_date_posted("2026-11-17", "2026-11-17"))
+        self.assertEqual("past_week", _unipile_date_posted("2026-11-11", "2026-11-17"))
+        self.assertEqual("past_month", _unipile_date_posted("2026-10-19", "2026-11-17"))
+        self.assertEqual("past_month", _unipile_date_posted("2026-01-01", "2026-11-17"))
+        self.assertEqual("past_month", _unipile_date_posted("", ""))
+
+    def test_request_shape_and_parsed_items(self):
+        from lib.linkedin import search_linkedin_unipile
+
+        with mock.patch(
+            "lib.linkedin.http.post",
+            return_value={"object": "LinkedinSearch", "items": [self._unipile_item()], "cursor": None},
+        ) as mock_post:
+            result = search_linkedin_unipile(
+                "conversational commerce", "2026-10-19", "2026-11-17", settings=self.SETTINGS
+            )
+        args, kwargs = mock_post.call_args
+        self.assertEqual("https://api1.unipile.com:13111/api/v1/linkedin/search", args[0])
+        body = args[1]
+        self.assertEqual("classic", body["api"])
+        self.assertEqual("posts", body["category"])
+        self.assertEqual("conversational commerce", body["keywords"])
+        self.assertEqual("past_month", body["date_posted"])
+        self.assertEqual("fake-key", kwargs["headers"]["X-API-KEY"])
+        self.assertEqual("acc_123", kwargs["params"]["account_id"])
+        self.assertLessEqual(kwargs["params"]["limit"], 49)
+
+        items = parse_linkedin_response(result, from_date="2026-10-19", to_date="2026-11-17")
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual("Conversational commerce is moving to messaging apps.", item["text"])
+        self.assertEqual("https://www.linkedin.com/posts/janedoe_activity-7300000000000000001-abcd", item["url"])
+        self.assertEqual("Jane Doe", item["author"])
+        self.assertEqual("https://www.linkedin.com/in/janedoe", item["author_url"])
+        self.assertEqual("2026-11-12", item["date"])
+        self.assertEqual({"likes": 120, "comments": 7, "reposts": 3}, item["engagement"])
+
+    def test_company_author_url(self):
+        from lib.linkedin import _unipile_post
+
+        post = _unipile_post(self._unipile_item(author={"public_identifier": "acme", "name": "Acme", "is_company": True}))
+        self.assertEqual("https://www.linkedin.com/company/acme", post["author"]["url"])
+
+    def test_follows_cursor_and_dedupes(self):
+        from lib.linkedin import search_linkedin_unipile
+
+        first = {"items": [self._unipile_item()], "cursor": "c1"}
+        second = {"items": [
+            self._unipile_item(),
+            self._unipile_item(social_id="urn:li:activity:2", share_url="https://www.linkedin.com/posts/b"),
+        ], "cursor": None}
+        with mock.patch("lib.linkedin.http.post", side_effect=[first, second]) as mock_post:
+            result = search_linkedin_unipile("topic", "2026-11-11", "2026-11-17", settings=self.SETTINGS)
+        self.assertEqual(2, mock_post.call_count)
+        self.assertEqual("c1", mock_post.call_args_list[1].kwargs["params"]["cursor"])
+        self.assertEqual(2, len(result["posts"]))
+
+    def test_http_error_reports_error_without_posts(self):
+        from lib import http as http_module
+        from lib.linkedin import search_linkedin_unipile
+
+        with mock.patch(
+            "lib.linkedin.http.post",
+            side_effect=http_module.HTTPError("unauthorized", status_code=401),
+        ):
+            result = search_linkedin_unipile("topic", "2026-11-11", "2026-11-17", settings=self.SETTINGS)
+        self.assertEqual([], result["posts"])
+        self.assertEqual("Unipile HTTP 401", result["error"])
+        self.assertNotIn("fake-key", result["error"])
+
+    def test_no_settings_no_call(self):
+        from lib.linkedin import search_linkedin_unipile
+
+        with mock.patch("lib.linkedin.http.post") as mock_post:
+            result = search_linkedin_unipile("topic", "2026-11-11", "2026-11-17", settings=None)
+        self.assertEqual({"posts": []}, result)
+        mock_post.assert_not_called()
+
+    def test_textless_items_are_dropped(self):
+        from lib.linkedin import search_linkedin_unipile
+
+        with mock.patch(
+            "lib.linkedin.http.post",
+            return_value={"items": [self._unipile_item(text="")], "cursor": None},
+        ):
+            result = search_linkedin_unipile("topic", "2026-11-11", "2026-11-17", settings=self.SETTINGS)
+        self.assertEqual([], result["posts"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,1 @@
+LinkedIn can now run on a Unipile account instead of ScrapeCreators: set `UNIPILE_DSN`, `UNIPILE_API_KEY` and `UNIPILE_ACCOUNT_ID` (with `linkedin` in `INCLUDE_SOURCES`) and the source runs LinkedIn's own post search as that connected account, with live reaction, comment and repost counts. When both are configured, Unipile is used.

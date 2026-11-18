@@ -677,6 +677,10 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('XAI_BASE_URL', None),
         ('OPENROUTER_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
+        # Unipile LinkedIn backend (linkedin.py): all three or none.
+        ('UNIPILE_DSN', None),
+        ('UNIPILE_API_KEY', None),
+        ('UNIPILE_ACCOUNT_ID', None),
         ('APIFY_API_TOKEN', None),
         ('AUTH_TOKEN', None),
         ('CT0', None),
